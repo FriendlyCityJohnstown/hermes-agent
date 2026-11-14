@@ -6006,6 +6006,48 @@ def _resolve_task_provider_model(
     task: str | None = None, provider: str | None = None, model: str | None = None, base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """The resolved route for an auxiliary call, with the owner's model policy applied.
+
+    An auxiliary task resolves its own model from ``auxiliary.<task>`` - it does
+    not inherit the session's - so this is a SECOND subsystem that can put a
+    call on a model, and the delegation guard does not reach it. The policy is
+    the same one: a model on ``delegation.blocked_models`` may not run.
+
+    Enforced here rather than in the config reader: a reader has callers that
+    only display settings, and refusing there would break a settings screen for
+    a route that is never dialled.
+    """
+    route = _resolve_task_provider_model_unchecked(
+        task=task, provider=provider, model=model, base_url=base_url, api_key=api_key)
+    from tools.delegate_tool_config import blocked_model_reason, blocked_models_from
+    blocked = blocked_models_from(_aux_policy_config())
+    if blocked:
+        # The resolved model is the one that will be dialled (index 1).
+        reason = blocked_model_reason(route[1], blocked)
+        if reason:
+            raise ValueError(f"Auxiliary task {task!r}: {reason}")
+    return route
+
+
+def _aux_policy_config() -> dict:
+    """The config the model policy is read from, or {} when it cannot be read.
+
+    A policy read must never be the reason a side task fails to run: if the
+    config is unreadable, the resolution proceeds exactly as it did before.
+    """
+    import contextlib
+    with contextlib.suppress(Exception):
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        delegation = cfg.get("delegation")
+        return delegation if isinstance(delegation, dict) else {}
+    return {}
+
+
+def _resolve_task_provider_model_unchecked(
+    task: str | None = None, provider: str | None = None, model: str | None = None, base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine (provider, model, base_url, api_key, api_mode) for a call.
 
     Priority: explicit args > config auxiliary.{task}.* > "auto". A bare base_url means custom,

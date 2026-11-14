@@ -98,6 +98,47 @@ class BlockedModelRefusalTests(unittest.TestCase):
         self.assertIsNone(creds.get("model"))
 
 
+class AuxiliaryPathTests(unittest.TestCase):
+    """An auxiliary task resolves its OWN model, so it needs the same policy.
+
+    Delegation is not the only subsystem that can put a call on a model: an
+    auxiliary task reads `auxiliary.<task>.model` directly and never touches the
+    delegation credential resolver. A config-only route is exactly how the
+    earlier leak happened, so it is refused at the same kind of chokepoint.
+    """
+
+    def setUp(self):
+        from agent import auxiliary_client as ac
+        self.ac = ac
+        self._original = ac._aux_policy_config
+
+    def tearDown(self):
+        self.ac._aux_policy_config = self._original
+
+    def test_a_blocked_model_is_refused(self):
+        self.ac._aux_policy_config = lambda: {"blocked_models": ["deepseek-v4-pro"]}
+        with self.assertRaises(ValueError) as error:
+            self.ac._resolve_task_provider_model(task="compression", model="deepseek-v4-pro")
+        self.assertIn("blocked_models", str(error.exception))
+
+    def test_the_same_model_is_fine_when_nothing_is_blocked(self):
+        self.ac._aux_policy_config = dict
+        route = self.ac._resolve_task_provider_model(task="compression", model="deepseek-v4-pro")
+        self.assertEqual(route[1], "deepseek-v4-pro", "an empty policy must change nothing")
+
+    def test_an_allowed_model_is_unaffected(self):
+        self.ac._aux_policy_config = lambda: {"blocked_models": ["deepseek-v4-pro"]}
+        route = self.ac._resolve_task_provider_model(task="compression", model="deepseek-flash")
+        self.assertEqual(route[1], "deepseek-flash")
+
+    def test_an_unreadable_config_never_fails_the_call(self):
+        # A policy read must not be the reason a side task dies.
+        self.ac._aux_policy_config = dict
+        route = self.ac._resolve_task_provider_model(task="compression")
+        self.assertIsInstance(route, tuple)
+        self.assertEqual(len(route), 5)
+
+
 class _Parent:
     """A stand-in for the parent agent, with only what the resolver reads."""
 
