@@ -187,13 +187,15 @@ def _refuse_under_worker_snapshot(home: Path) -> None:
             f"cannot run as the profile at {home}. Delegate without a profile.")
 
 
-def _profile_route(home: Path) -> TaskRoute:
+def _profile_route(home: Path, blocked: tuple = ()) -> TaskRoute:
     """The profile's own primary route, resolved inside its scope (its config.yaml + secrets). The
     child never borrows the launching profile's key, pool, fallback chain or reasoning level."""
     from hermes_cli.config import load_config_readonly
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_constants import resolve_reasoning_config
-    from tools.delegate_tool_config import ResolvedReasoning, _credential_bundle, _require_pinned_command
+    from tools.delegate_tool_config import (
+        ResolvedReasoning, _credential_bundle, _require_pinned_command, blocked_model_reason,
+    )
     _refuse_under_worker_snapshot(home)
     with delegated_profile_scope(home):
         cfg = load_config_readonly() or {}
@@ -203,6 +205,12 @@ def _profile_route(home: Path) -> TaskRoute:
         except Exception as exc:
             raise DelegationRouteError(f"Profile at {home} has no usable model provider: {exc}") from exc
         model = request["target_model"] or rt.get("model") or None
+        if blocked:
+            # A profile may not run a child on a model the owner blocked, even
+            # though the profile's own config never mentions the blocklist.
+            reason = blocked_model_reason(model, blocked)
+            if reason:
+                raise DelegationRouteError(f"Profile at {home}: {reason}")
         fallback = cfg.get("fallback_providers")
     # A named custom provider resolves to provider "custom": keep its name as the identity (as delegation.provider
     # does) so two named providers sharing one URL never lease each other's pool.
@@ -231,8 +239,13 @@ def _with_inherited_fallback(route: dict[str, Any], config: Mapping[str, Any]) -
 
 
 def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> TaskRoute:
+    from tools.delegate_tool_config import _cfg, blocked_models_from
+    # The operator's own blocklist travels with the route: a profile route is
+    # resolved inside the profile's scope, so it never sees the parent's
+    # config, and must still honour the parent's policy.
+    blocked = blocked_models_from(route) or blocked_models_from(_cfg())
     if route.get("profile"):
-        return replace(_profile_route(_profile_home(route["profile"])), backend=backend)
+        return replace(_profile_route(_profile_home(route["profile"]), blocked), backend=backend)
     from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):

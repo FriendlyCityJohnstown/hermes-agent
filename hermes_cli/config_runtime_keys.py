@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 CORE_RUNTIME_KEYS: dict[str, str] = {
     "computer_use.backend": "plugins/computer_use/__init__.py configured_backend_name() (unset = cua)",
     "dashboard.kanban": "plugins/kanban/dashboard/plugin_api.py (bundled dashboard tab preferences)",
+    "delegation.blocked_models": (
+        "tools/delegate_tool_config.py blocked_models_from() "
+        "(models that may not run a child; owner policy)"
+    ),
 }
 
 

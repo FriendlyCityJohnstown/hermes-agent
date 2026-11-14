@@ -34,6 +34,67 @@ def _cfg() -> dict:
     return _load_config()
 
 
+# ── Blocked models (owner policy) ────────────────────────────────────────────
+# A model on this list may never run a child. The check lives HERE, where the
+# child's credentials are resolved, because a configuration value alone is not
+# a guarantee: on 2026-11-13 a route leaked into the shared delegation model
+# and children ran on a metered model nobody chose for that lane.
+#
+# The list is config-driven (``delegation.blocked_models``) so the owner can
+# change it without touching code, and it is enforced for EVERY route that can
+# put a child on a model: an explicit ``delegation.model``, a profile's own
+# model, and the parent model a child inherits.
+_MODEL_ID_PREFIXES = ("deepseek/", "openrouter/", "anthropic/", "openai/", "x-ai/", "xai/")
+
+
+def _normalize_model_id(model: Any) -> str:
+    """A model id lowercased with any provider prefix stripped."""
+    if not isinstance(model, str):
+        return ""
+    text = model.strip().lower()
+    for prefix in _MODEL_ID_PREFIXES:
+        if text.startswith(prefix):
+            return text[len(prefix):]
+    return text
+
+
+def blocked_models_from(cfg: Any) -> list[str]:
+    """The ``delegation.blocked_models`` list, normalized and de-duplicated."""
+    if not isinstance(cfg, dict):
+        return []
+    raw = cfg.get("blocked_models")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in raw:
+        text = _normalize_model_id(item)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def blocked_model_reason(model: Any, blocked: Any) -> Optional[str]:
+    """Why this model may not run a child, or None when it may.
+
+    A pattern matches the model itself or any model whose id starts with it,
+    so one entry can cover a whole family (``deepseek-v4-pro`` covers
+    ``deepseek-v4-pro-20261101``).
+    """
+    target = _normalize_model_id(model)
+    if not target:
+        return None
+    for pattern in blocked or ():
+        pattern = _normalize_model_id(pattern)
+        if pattern and (target == pattern or target.startswith(pattern)):
+            return (
+                f"Model {model!r} is on delegation.blocked_models (owner policy) and may not run a child. "
+                f"Choose a model that is not blocked, or remove it from delegation.blocked_models."
+            )
+    return None
+
+
 # ── Subagent approval callbacks ─────────────────────────────────────────────
 # Subagent worker threads don't inherit the CLI's threading.local approval
 # callback, so prompt_dangerous_approval() would fall back to input() and
@@ -387,7 +448,7 @@ def _credential_bundle(model, provider, base_url, api_key, api_mode, request_ove
         "request_overrides": request_overrides, **extra,
     }
 
-def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
+def _direct_endpoint_credentials(v: dict, explicit_request_overrides, blocked=()) -> dict:
     """``delegation.base_url`` branch: provider/api_mode from URL heuristics."""
     # Shared URL-based api_mode detector so Anthropic-compatible direct endpoints (/anthropic suffix: Azure AI
     # Foundry, MiniMax, Zhipu, LiteLLM) get the Messages transport instead of 404ing on chat_completions.
@@ -427,7 +488,7 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         _merge_request_overrides(request_overrides, explicit_request_overrides),
     )
 
-def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
+def _runtime_provider_credentials(v: dict, explicit_request_overrides, blocked=()) -> dict:
     """``delegation.provider`` branch: full bundle via the runtime provider system."""
     configured_provider = v["provider"]
     try:
@@ -465,6 +526,13 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
             f"Refusing to build a subagent with an incomplete credential bundle — check the provider's "
             f"configuration / auth, or set delegation.base_url for a direct endpoint."
         )
+    if blocked:
+        # The provider may have chosen the model itself (a provider default, or
+        # a model the route did not name), so the RESOLVED model is what the
+        # blocklist must be asked about.
+        reason = blocked_model_reason(v["model"] or runtime.get("model"), blocked)
+        if reason:
+            raise ValueError(reason)
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
         configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
@@ -481,18 +549,39 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     with a user-facing message."""
     values = {k: str(cfg.get(k) or "").strip() or None for k in ("model", "provider", "base_url", "api_key")}
     values["api_mode"] = str(cfg.get("api_mode") or "").strip().lower() or None
+    # Owner policy: a blocked model may not run a child, on ANY route. Checked
+    # before the credentials are built so the refusal names the model.
+    # The route may BE the delegation section (the default backend) or a
+    # task-specific dict (a backend that declares its own parameters). The
+    # operator's policy lives in the config either way, so the config is the
+    # fallback rather than the route alone.
+    blocked = blocked_models_from(cfg) or blocked_models_from(_cfg())
+    if blocked:
+        reason = blocked_model_reason(values["model"], blocked)
+        if reason:
+            raise ValueError(reason)
     explicit_request_overrides = cfg.get("request_overrides") if isinstance(cfg.get("request_overrides"), dict) else None
     is_native_sdk_provider = (values["provider"] or "").strip().lower() in _NATIVE_SDK_PROVIDERS
 
     if values["base_url"] and not is_native_sdk_provider:
-        return _direct_endpoint_credentials(values, explicit_request_overrides)
+        if blocked:
+            reason = blocked_model_reason(values["model"], blocked)
+            if reason:
+                raise ValueError(reason)
+        return _direct_endpoint_credentials(values, explicit_request_overrides, blocked)
     if not values["provider"]:
         # Pure inherit; explicit request_overrides still merge OVER the parent's.
+        # The child runs on the parent's model, so the parent's model is what the
+        # blocklist must be asked about here.
+        if blocked:
+            reason = blocked_model_reason(values["model"] or getattr(parent_agent, "model", None), blocked)
+            if reason:
+                raise ValueError(reason)
         return _credential_bundle(
             values["model"], None, None, None, None,
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
         )
-    return _runtime_provider_credentials(values, explicit_request_overrides)
+    return _runtime_provider_credentials(values, explicit_request_overrides, blocked)
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
