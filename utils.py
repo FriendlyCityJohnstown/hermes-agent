@@ -277,6 +277,35 @@ def atomic_replace(tmp_path: str | Path, target: str | Path) -> str:
     return real_path
 
 
+def read_text_windows_retry(path: str | Path, *, encoding: str = "utf-8", errors: str | None = None) -> str:
+    """Read *path* as text, retrying transient Windows contended-replace errors (winerror 5/32/33).
+
+    Symmetric reader side of :func:`atomic_replace`: on Windows NTFS, ``os.replace`` onto an
+    existing file briefly leaves the replaced entry delete-pending (``WinError 5``), and AV/EDR
+    scanners or an in-place rewrite fallback can raise ``WinError 32``/``33``. Bounded jittered
+    retry rides out that window while preserving permanent ACL denials and non-Windows behavior.
+    """
+    try:
+        with open(path, "r", encoding=encoding, errors=errors) as f:
+            return f.read()
+    except OSError as exc:
+        if not _is_contended_windows_replace_error(exc):
+            raise
+        from agent.retry_utils import jittered_backoff
+        for attempt in range(1, _REPLACE_RETRY_ATTEMPTS + 1):
+            time.sleep(jittered_backoff(
+                attempt, base_delay=_REPLACE_RETRY_BASE_DELAY_S, max_delay=_REPLACE_RETRY_MAX_DELAY_S
+            ))
+            try:
+                with open(path, "r", encoding=encoding, errors=errors) as f:
+                    return f.read()
+            except OSError as retry_exc:
+                exc = retry_exc
+                if not _is_contended_windows_replace_error(retry_exc):
+                    raise
+        raise exc
+
+
 def _publish_path(target_str: str) -> str:
     """The path :func:`atomic_replace` renames onto: a symlink's real file, else the target itself."""
     return os.path.realpath(target_str) if os.path.islink(target_str) else target_str

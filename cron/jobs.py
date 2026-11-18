@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 from hermes_time import now as _hermes_now
 from hermes_time import get_timezone
 from hermes_cli.observability.shared_metrics_gateway import record_cron_missed
-from utils import atomic_replace, atomic_write_text, fsync_directory, mkstemp_beside
+from utils import atomic_replace, atomic_write_text, fsync_directory, mkstemp_beside, read_text_windows_retry
 
 # croniter is imported lazily (slow import, only needed for cron exprs). HAS_CRONITER stays a
 # module attribute: a monkeypatched value wins because _ensure_croniter only probes while None
@@ -1364,14 +1364,27 @@ def get_ticker_last_error() -> Optional[str]:
 
 def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
     """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM, strict
-    failure retries with ``strict=False``. IO/fallback errors propagate (caller decides repair vs
-    bail)."""
-    with open(jobs_file, "r", encoding="utf-8-sig") as f:
-        raw = f.read()
+    failure retries with ``strict=False``. Retries transient Windows contended-replace errors
+    (winerror 5/32/33) and, on Windows, re-reads once if an in-place rewrite fallback tore the
+    JSON mid-read. Permanent IO/fallback errors propagate (caller decides repair vs bail)."""
+    raw = read_text_windows_retry(jobs_file, encoding="utf-8-sig")
     try:
         return json.loads(raw), False
     except json.JSONDecodeError:
-        return json.loads(raw, strict=False), True
+        try:
+            return json.loads(raw, strict=False), True
+        except json.JSONDecodeError:
+            if os.name != "nt":
+                raise
+            # On Windows, atomic_replace can fall back to _rewrite_in_place when os.replace
+            # is contended; a concurrent reader landing mid-rewrite sees truncated JSON that
+            # clears milliseconds later. Re-read once before reporting corruption.
+            time.sleep(0.05)
+            raw = read_text_windows_retry(jobs_file, encoding="utf-8-sig")
+            try:
+                return json.loads(raw), False
+            except json.JSONDecodeError:
+                return json.loads(raw, strict=False), True
 
 
 def load_jobs() -> list[dict[str, Any]]:
