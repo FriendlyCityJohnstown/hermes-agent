@@ -170,3 +170,61 @@ async def test_a_slow_stored_read_never_holds_an_interrupt(rig, method):
         release.set()
     sock.inbound.put_nowait(None)
     await asyncio.wait_for(task, 30)
+
+
+@pytest.mark.asyncio
+async def test_post_disconnect_uvicorn_close_error_does_not_warn_or_clobber_reason(rig, caplog):
+    """If a client disconnects while session.context_breakdown is running, Uvicorn's post-close
+    send RuntimeError must not emit WARNINGs or overwrite disconnect_reason/send_failures."""
+    import logging
+
+    sock, gates, log = rig
+    gates["session.context_breakdown"] = release = asyncio.Event()
+    real_send = type(sock).send_text
+
+    async def post_close_send(self, line):
+        if json.loads(line).get("id") == "ctx":
+            raise RuntimeError(
+                "Unexpected ASGI message 'websocket.send', after sending 'websocket.close' or response already completed."
+            )
+        await real_send(self, line)
+
+    type(sock).send_text = post_close_send
+    try:
+        with caplog.at_level(logging.INFO, logger="tui_gateway.ws"):
+            task = asyncio.create_task(ws_mod.handle_ws(sock))
+            sock.inbound.put_nowait(rpc("ctx", "session.context_breakdown"))
+            assert await settle(lambda: "start:ctx" in log)
+            sock.inbound.put_nowait(None)
+            assert await settle(lambda: sock.received == 1)
+            await asyncio.sleep(0.05)
+            release.set()
+            await asyncio.wait_for(task, 10)
+    finally:
+        type(sock).send_text = real_send
+
+    warnings = [r for r in caplog.records if r.name == "tui_gateway.ws" and r.levelno >= logging.WARNING]
+    assert warnings == [], [r.getMessage() for r in warnings]
+    closed_msgs = [r.getMessage() for r in caplog.records if r.name == "tui_gateway.ws" and "ws closed" in r.getMessage()]
+    assert len(closed_msgs) == 1
+    assert "reason=client_disconnect(" in closed_msgs[0]
+    assert "send_failures=0" in closed_msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_send_error_while_connected_still_warns(rig, caplog):
+    """While the client is still connected, an unexpected send error still logs WARNINGs and
+    records send_failures."""
+    import logging
+
+    sock, _gates, _log = rig
+    sock.fail_ids.add("ctx")
+
+    with caplog.at_level(logging.WARNING, logger="tui_gateway.ws"):
+        task = asyncio.create_task(ws_mod.handle_ws(sock))
+        sock.inbound.put_nowait(rpc("ctx", "session.context_breakdown"))
+        await asyncio.wait_for(task, 10)
+
+    warn_msgs = [r.getMessage() for r in caplog.records if r.name == "tui_gateway.ws" and r.levelno >= logging.WARNING]
+    assert any("ws send failed" in m for m in warn_msgs), warn_msgs
+    assert any("ws response send failed" in m for m in warn_msgs), warn_msgs

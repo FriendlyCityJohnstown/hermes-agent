@@ -136,6 +136,22 @@ except ImportError:  # pragma: no cover - starlette is a required install path
     _WebSocketDisconnect = Exception  # type: ignore[assignment]
 
 
+def _is_closed_ws_error(exc: BaseException) -> bool:
+    """True for expected peer-closed WebSocket send exceptions (Starlette/Uvicorn post-close)."""
+    if _WebSocketDisconnect is not Exception and isinstance(exc, _WebSocketDisconnect):
+        return True
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        return (
+            "after sending 'websocket.close'" in msg
+            or "close message has been sent" in msg
+            or "response already completed" in msg
+        )
+    return False
+
+
 class WSTransport:
     """Per-connection WS transport. ``write`` is safe from any thread *other than* the loop thread owning the
     socket (pool workers marshal onto the loop and block on the future); from the loop thread itself it would
@@ -296,7 +312,8 @@ class WSTransport:
                 except Exception as exc:
                     # Latch while holding the writer lock so queued batches observe the failure first.
                     self._closed = True
-                    _log.warning("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
+                    log_fn = _log.debug if _is_closed_ws_error(exc) else _log.warning
+                    log_fn("ws send failed peer=%s error_type=%s error=%s", self._peer, type(exc).__name__, exc)
                     return
 
     def close(self) -> None:  # loop thread (handle_ws finally), so the TimerHandle is safe
@@ -442,9 +459,12 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         """write_async; on failure record *reason*, log *msg* and end the read loop."""
         nonlocal disconnect_reason, send_failures
         if not await transport.write_async(frame):
-            disconnect_reason = reason
-            send_failures += 1
-            _log.warning(msg, *args)
+            if client_gone.is_set():
+                _log.debug(msg, *args)
+            else:
+                disconnect_reason = reason
+                send_failures += 1
+                _log.warning(msg, *args)
             raise _SendFailed
 
     def _error(code: int, message: str, req_id: Any) -> dict:
