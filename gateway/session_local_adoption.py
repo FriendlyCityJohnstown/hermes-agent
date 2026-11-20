@@ -61,7 +61,10 @@ async def adopt_before_restore(authority, sid, *, tracked=True):
 async def adopt_local_compressions(authority):
     """Boot and hot-profile recovery: every receipt's due catch-up, before ``recover_local_sessions``."""
     from gateway.session_local_recovery import local_receipt_ids
-    for sid in local_receipt_ids(authority):
+    # The receipt scan reads the whole receipt prefix: it runs in a worker so a cold or contended
+    # ``state_meta`` cannot stall the owner loop (and with it the liveness probes every profile on
+    # that loop depends on). The scan is read-only; the catch-ups it feeds still commit on a worker.
+    for sid in await asyncio.to_thread(local_receipt_ids, authority):
         await adopt_before_restore(authority, sid, tracked=False)
 
 
